@@ -657,7 +657,7 @@ export default function Home() {
           <AlertTriangle className="w-10 h-10 text-zinc-500 mx-auto mb-4 stroke-[1.5]" />
           <h2 className="text-lg font-semibold text-zinc-800 mb-2 font-sans">Connection Disrupted</h2>
           <p className="text-xs text-zinc-500 mb-4 font-sans leading-relaxed">
-            We couldn't connect to the secure message pool. This can happen during initial database synchronization or under high network latency.
+            We couldn&apos;t connect to the secure message pool. This can happen during initial database synchronization or under high network latency.
           </p>
           <div className="p-3 bg-zinc-50 text-zinc-600 border border-zinc-100 rounded-lg text-left text-xs font-mono overflow-auto max-h-32 mb-4">
             {initError}
@@ -916,7 +916,7 @@ export default function Home() {
                 {/* Message Text */}
                 <div className="my-auto py-4">
                   <p className={`${fontSizeClass} ${cardTextClass} break-words transition-colors duration-150`}>
-                    "{currentStrangerMessage.text}"
+                    &ldquo;{currentStrangerMessage.text}&rdquo;
                   </p>
                 </div>
  
@@ -1020,7 +1020,7 @@ export default function Home() {
                       Your message today:
                     </p>
                     <div className="p-4 bg-zinc-50/50 border border-zinc-100/80 rounded-xl text-xs text-zinc-600 font-medium break-words leading-relaxed">
-                      "{lastUserMessage.text}"
+                      &ldquo;{lastUserMessage.text}&rdquo;
                     </div>
                   </div>
                 )}
