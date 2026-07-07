@@ -1,0 +1,8 @@
+{
+  "name": "rp2p",
+  "description": "one message. one stranger. once a day.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

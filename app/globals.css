@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+/* Global Font Overrides to Helvetica/Arial */
+html, body, button, input, textarea, select, span, div, p, h1, h2, h3, h4, h5, h6, a {
+  font-family: "Helvetica Neue", Helvetica, Arial, "Nimbus Sans L", sans-serif !important;
+}
+
+/* Global focus and selection styles */
+::selection {
+  background-color: #000000 !important;
+  color: #ffffff !important;
+}
+
+/* Smooth transitons for crisp layout adjustments */
+.transition-swiss {
+  transition: all 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}

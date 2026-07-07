@@ -1,0 +1,8 @@
+{
+  "firestore": [
+    {
+      "database": "ai-studio-rp2p-a4dd3778-0710-456d-bd72-9e9e99cd9fdd",
+      "rules": "firestore.rules"
+    }
+  ]
+}

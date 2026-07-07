@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "Message": {
+      "title": "Message",
+      "description": "An anonymous message sent into the pool.",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The message body text (max 250 characters)."
+        },
+        "senderId": {
+          "type": "string",
+          "description": "The anonymous auth UID of the sender."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The server timestamp when the message was created."
+        },
+        "reports": {
+          "type": "integer",
+          "description": "Number of times this message was reported."
+        },
+        "randomId": {
+          "type": "number",
+          "description": "A random float used for O(1) random message retrieval."
+        }
+      },
+      "required": ["text", "senderId", "createdAt", "reports", "randomId"]
+    }
+  },
+  "firestore": {
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Collection of anonymous messages in the global pool."
+    }
+  }
+}

@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    match /messages/{messageId} {
+      // Allow read (get and list) if the user is signed in
+      allow read: if request.auth != null;
+
+      // Allow create if the user is signed in and the message is valid
+      allow create: if request.auth != null
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 250
+        && request.resource.data.senderId == request.auth.uid;
+
+      // Allow create by system for seeding
+      allow create: if request.auth != null
+        && request.resource.data.senderId == "system";
+
+      // Allow update if the user is signed in (for reporting)
+      allow update: if request.auth != null;
+    }
+  }
+}
