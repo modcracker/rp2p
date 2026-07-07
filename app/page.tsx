@@ -43,8 +43,9 @@ const STARTER_MESSAGES = [
 ];
 
 export default function Home() {
-  // Authentication & Loading
+  // --- 1. State & Ref Declarations (Grouped at the top) ---
   const [user, setUser] = useState<User | null>(null);
+  const [isGuestMode, setIsGuestMode] = useState(false);
   const [appReady, setAppReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [loadingMessage, setLoadingMessage] = useState("Connecting...");
@@ -53,6 +54,34 @@ export default function Home() {
   const [signingIn, setSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
 
+  // App States
+  const [currentStrangerMessage, setCurrentStrangerMessage] = useState<Message | null>(null);
+  const [lastUserMessage, setLastUserMessage] = useState<Message | null>(null);
+  const [hasSentToday, setHasSentToday] = useState(false);
+  const [cooldownRemaining, setCooldownRemaining] = useState<number | null>(null); // milliseconds
+  const [totalMessagesCount, setTotalMessagesCount] = useState<number | null>(null);
+
+  // Readability / Accessibility States for the Message Display Card
+  const [cardTheme, setCardTheme] = useState<"light" | "dark">("light");
+  const [cardFontSize, setCardFontSize] = useState<"sm" | "md" | "lg">("md");
+
+  // Form States
+  const [newMessage, setNewMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [success, setSuccess] = useState(false);
+  const [submittingReport, setSubmittingReport] = useState(false);
+  const [reportedIds, setReportedIds] = useState<string[]>([]);
+
+  // Local state for statistics (fun little footer features)
+  const [stats, setStats] = useState({
+    sentCount: 0,
+    receivedCount: 0
+  });
+
+  // Countdown timer reference
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // --- 2. Callback & Event Handlers ---
   const handleGoogleSignIn = async () => {
     setSigningIn(true);
     setSignInError(null);
@@ -69,9 +98,12 @@ export default function Home() {
 
   const handleSignOut = async () => {
     try {
-      await signOut(auth);
+      if (!isGuestMode) {
+        await signOut(auth);
+      }
       // Reset all user-specific states
       setUser(null);
+      setIsGuestMode(false);
       setHasSentToday(false);
       setLastUserMessage(null);
       setCurrentStrangerMessage(null);
@@ -80,16 +112,82 @@ export default function Home() {
     }
   };
 
-  // App States
-  const [currentStrangerMessage, setCurrentStrangerMessage] = useState<Message | null>(null);
-  const [lastUserMessage, setLastUserMessage] = useState<Message | null>(null);
-  const [hasSentToday, setHasSentToday] = useState(false);
-  const [cooldownRemaining, setCooldownRemaining] = useState<number | null>(null); // milliseconds
-  const [totalMessagesCount, setTotalMessagesCount] = useState<number | null>(null);
-
-  // Readability / Accessibility States for the Message Display Card
-  const [cardTheme, setCardTheme] = useState<"light" | "dark">("light");
-  const [cardFontSize, setCardFontSize] = useState<"sm" | "md" | "lg">("md");
+  const enterGuestMode = useCallback(async () => {
+    setIsGuestMode(true);
+    setInitError(null);
+    setAppReady(false);
+    setLoadingMessage("Entering Guest Mode...");
+    
+    // Simulate slight loading for beautiful polish
+    setTimeout(async () => {
+      const guestUser = {
+        uid: "guest-user-id",
+        email: "guest@pool.local",
+      } as User;
+      
+      setUser(guestUser);
+      
+      // Initialize guest pool if not present
+      if (typeof window !== "undefined") {
+        const localPool = localStorage.getItem("rp2p_guest_pool");
+        if (!localPool) {
+          const initialPool = STARTER_MESSAGES.map((text, idx) => ({
+            id: `g-starter-${idx + 1}`,
+            text,
+            senderId: "system",
+            createdAt: null,
+            reports: 0,
+            randomId: Math.random()
+          }));
+          localStorage.setItem("rp2p_guest_pool", JSON.stringify(initialPool));
+        }
+      }
+      
+      // Load guest states
+      const localPoolStr = localStorage.getItem("rp2p_guest_pool") || "[]";
+      const localPool = JSON.parse(localPoolStr);
+      setTotalMessagesCount(localPool.length);
+      
+      const savedLastSent = localStorage.getItem("rp2p_guest_last_sent");
+      if (savedLastSent) {
+        const lastSentTime = parseInt(savedLastSent, 10);
+        const now = Date.now();
+        const dayInMillis = 24 * 60 * 60 * 1000;
+        const timePassed = now - lastSentTime;
+        if (timePassed < dayInMillis) {
+          setHasSentToday(true);
+          const savedLastMsg = localStorage.getItem("rp2p_guest_last_msg");
+          setLastUserMessage(savedLastMsg ? JSON.parse(savedLastMsg) : { text: "Your message is active." });
+          setCooldownRemaining(dayInMillis - timePassed);
+        } else {
+          setHasSentToday(false);
+          setLastUserMessage(null);
+          setCooldownRemaining(null);
+        }
+      } else {
+        setHasSentToday(false);
+        setLastUserMessage(null);
+        setCooldownRemaining(null);
+      }
+      
+      const eligible = localPool.filter((msg: any) => msg.senderId !== "guest-user-id" && !reportedIds.includes(msg.id) && msg.reports < 3);
+      if (eligible.length > 0) {
+        const randomMsg = eligible[Math.floor(Math.random() * eligible.length)];
+        setCurrentStrangerMessage(randomMsg);
+      } else {
+        setCurrentStrangerMessage({
+          id: "system-empty",
+          text: "The pool is currently quiet. Write a message to share your thoughts.",
+          senderId: "system",
+          createdAt: null,
+          reports: 0,
+          randomId: 0.5
+        });
+      }
+      
+      setAppReady(true);
+    }, 800);
+  }, [reportedIds]);
 
   // Load preferences on mount
   useEffect(() => {
@@ -122,23 +220,7 @@ export default function Home() {
     }
   };
 
-  // Form States
-  const [newMessage, setNewMessage] = useState("");
-  const [sending, setSending] = useState(false);
-  const [success, setSuccess] = useState(false);
-  const [submittingReport, setSubmittingReport] = useState(false);
-  const [reportedIds, setReportedIds] = useState<string[]>([]);
-
-  // Local state for statistics (fun little footer features)
-  const [stats, setStats] = useState({
-    sentCount: 0,
-    receivedCount: 0
-  });
-
-  // Countdown timer reference
-  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
-
-  // --- 1. Connection Validation & Seeding ---
+  // --- 3. Connection Validation & Seeding ---
   const validateAndSeed = useCallback(async () => {
     setLoadingMessage("Checking connection...");
     const connPath = "test/connection";
@@ -195,6 +277,13 @@ export default function Home() {
 
   // --- 2. Query Total Count for Social Proof ---
   const fetchTotalCount = useCallback(async () => {
+    if (isGuestMode) {
+      if (typeof window !== "undefined") {
+        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
+        setTotalMessagesCount(localPool.length);
+      }
+      return;
+    }
     const messagesPath = "messages";
     try {
       const q = query(collection(db, "messages"));
@@ -203,10 +292,31 @@ export default function Home() {
     } catch (err) {
       console.error("Error fetching count:", err);
     }
-  }, []);
+  }, [isGuestMode]);
 
   // --- 3. Retrieve Random Stranger Message ---
   const fetchRandomMessage = useCallback(async (currentUserUid: string) => {
+    if (isGuestMode) {
+      if (typeof window !== "undefined") {
+        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
+        const eligible = localPool.filter((msg: any) => msg.senderId !== currentUserUid && !reportedIds.includes(msg.id) && msg.reports < 3);
+        if (eligible.length > 0) {
+          const randomMsg = eligible[Math.floor(Math.random() * eligible.length)];
+          setCurrentStrangerMessage(randomMsg);
+          setStats(prev => ({ ...prev, receivedCount: prev.receivedCount + 1 }));
+        } else {
+          setCurrentStrangerMessage({
+            id: "system-empty",
+            text: "The pool is currently quiet. Write a message to share your thoughts.",
+            senderId: "system",
+            createdAt: null,
+            reports: 0,
+            randomId: 0.5
+          });
+        }
+      }
+      return;
+    }
     const messagesPath = "messages";
     try {
       const r = Math.random();
@@ -264,10 +374,32 @@ export default function Home() {
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, messagesPath);
     }
-  }, [reportedIds]);
+  }, [reportedIds, isGuestMode]);
 
   // --- 4. Check If User Has Sent Message Today ---
   const checkSendingStatus = useCallback(async (currentUserUid: string) => {
+    if (isGuestMode) {
+      if (typeof window !== "undefined") {
+        const savedLastSent = localStorage.getItem("rp2p_guest_last_sent");
+        if (savedLastSent) {
+          const lastSentTime = parseInt(savedLastSent, 10);
+          const now = Date.now();
+          const dayInMillis = 24 * 60 * 60 * 1000;
+          const timePassed = now - lastSentTime;
+          if (timePassed < dayInMillis) {
+            setHasSentToday(true);
+            const savedLastMsg = localStorage.getItem("rp2p_guest_last_msg");
+            setLastUserMessage(savedLastMsg ? JSON.parse(savedLastMsg) : { text: "Your message is active." });
+            setCooldownRemaining(dayInMillis - timePassed);
+            return;
+          }
+        }
+      }
+      setHasSentToday(false);
+      setLastUserMessage(null);
+      setCooldownRemaining(null);
+      return;
+    }
     const messagesPath = "messages";
     try {
       const q = query(
@@ -306,7 +438,7 @@ export default function Home() {
       setHasSentToday(false);
       setLastUserMessage(null);
     }
-  }, []);
+  }, [isGuestMode]);
 
   // --- 5. Countdown Handler ---
   useEffect(() => {
@@ -348,6 +480,45 @@ export default function Home() {
     if (!user || sending || newMessage.trim().length === 0 || newMessage.length > 250) return;
 
     setSending(true);
+    
+    if (isGuestMode) {
+      // Simulate network wait
+      setTimeout(async () => {
+        try {
+          const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
+          const newMsg = {
+            id: `g-user-${Date.now()}`,
+            text: newMessage.trim(),
+            senderId: user.uid,
+            createdAt: null,
+            reports: 0,
+            randomId: Math.random()
+          };
+          
+          localPool.push(newMsg);
+          localStorage.setItem("rp2p_guest_pool", JSON.stringify(localPool));
+          localStorage.setItem("rp2p_guest_last_sent", Date.now().toString());
+          localStorage.setItem("rp2p_guest_last_msg", JSON.stringify(newMsg));
+          
+          setStats(prev => ({ ...prev, sentCount: prev.sentCount + 1 }));
+          setNewMessage("");
+          setSuccess(true);
+          
+          await checkSendingStatus(user.uid);
+          await fetchTotalCount();
+          
+          setTimeout(() => {
+            setSuccess(false);
+          }, 4000);
+        } catch (err) {
+          console.error("Local save failed:", err);
+        } finally {
+          setSending(false);
+        }
+      }, 600);
+      return;
+    }
+    
     const messagesPath = "messages";
     
     try {
@@ -388,6 +559,28 @@ export default function Home() {
     if (!user || !currentStrangerMessage || submittingReport) return;
 
     setSubmittingReport(true);
+    
+    if (isGuestMode) {
+      try {
+        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
+        const updatedPool = localPool.map((msg: any) => {
+          if (msg.id === currentStrangerMessage.id) {
+            return { ...msg, reports: msg.reports + 1 };
+          }
+          return msg;
+        });
+        localStorage.setItem("rp2p_guest_pool", JSON.stringify(updatedPool));
+        
+        setReportedIds(prev => [...prev, currentStrangerMessage.id]);
+        await fetchRandomMessage(user.uid);
+      } catch (err) {
+        console.error("Local report failed:", err);
+      } finally {
+        setSubmittingReport(false);
+      }
+      return;
+    }
+    
     const messagesPath = `messages/${currentStrangerMessage.id}`;
     
     try {
@@ -413,6 +606,7 @@ export default function Home() {
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       try {
         if (currentUser) {
+          setIsGuestMode(false);
           setUser(currentUser);
           
           // Seed starter messages, validate connection, fetch states
@@ -421,7 +615,10 @@ export default function Home() {
           await fetchRandomMessage(currentUser.uid);
           await fetchTotalCount();
         } else {
-          setUser(null);
+          setUser(prev => {
+            if (prev && prev.uid === "guest-user-id") return prev;
+            return null;
+          });
         }
         setAppReady(true);
       } catch (err) {
@@ -431,7 +628,7 @@ export default function Home() {
     });
 
     return () => unsubscribe();
-  }, [validateAndSeed, checkSendingStatus, fetchRandomMessage, fetchTotalCount]);
+  }, [validateAndSeed, checkSendingStatus, fetchRandomMessage, fetchTotalCount, isGuestMode]);
 
   // Load custom stats from LocalStorage on mount
   useEffect(() => {
@@ -465,12 +662,20 @@ export default function Home() {
           <div className="p-3 bg-zinc-50 text-zinc-600 border border-zinc-100 rounded-lg text-left text-xs font-mono overflow-auto max-h-32 mb-4">
             {initError}
           </div>
-          <button 
-            onClick={() => window.location.reload()} 
-            className="w-full px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-xl text-xs font-medium tracking-wide transition-all duration-150 cursor-pointer"
-          >
-            Reconnect to Pool
-          </button>
+          <div className="flex flex-col gap-2 w-full">
+            <button 
+              onClick={() => window.location.reload()} 
+              className="w-full px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-xl text-xs font-medium tracking-wide transition-all duration-150 cursor-pointer"
+            >
+              Reconnect to Pool
+            </button>
+            <button 
+              onClick={enterGuestMode} 
+              className="w-full px-4 py-2.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-600 rounded-xl text-xs font-medium tracking-wide transition-all duration-150 cursor-pointer border border-zinc-200/50"
+            >
+              Enter Offline Guest Mode
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -538,28 +743,37 @@ export default function Home() {
               </div>
             )}
 
-            <button
-              onClick={handleGoogleSignIn}
-              disabled={signingIn}
-              className="w-full py-3 px-5 bg-zinc-900 hover:bg-zinc-800 disabled:bg-zinc-50 disabled:text-zinc-400 disabled:border-zinc-200 text-white rounded-xl font-sans text-xs uppercase tracking-wider font-semibold transition-all duration-150 flex items-center justify-center space-x-2.5 cursor-pointer disabled:cursor-not-allowed border border-zinc-900"
-            >
-              {signingIn ? (
-                <>
-                  <RotateCw className="w-4 h-4 animate-spin stroke-[2]" />
-                  <span>Signing in...</span>
-                </>
-              ) : (
-                <>
-                  <svg className="w-4 h-4 fill-white" viewBox="0 0 24 24">
-                    <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                    <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                    <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
-                    <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
-                  </svg>
-                  <span>Sign in with Google</span>
-                </>
-              )}
-            </button>
+            <div className="flex flex-col gap-2.5 w-full">
+              <button
+                onClick={handleGoogleSignIn}
+                disabled={signingIn}
+                className="w-full py-3 px-5 bg-zinc-900 hover:bg-zinc-800 disabled:bg-zinc-50 disabled:text-zinc-400 disabled:border-zinc-200 text-white rounded-xl font-sans text-xs uppercase tracking-wider font-semibold transition-all duration-150 flex items-center justify-center space-x-2.5 cursor-pointer disabled:cursor-not-allowed border border-zinc-900"
+              >
+                {signingIn ? (
+                  <>
+                    <RotateCw className="w-4 h-4 animate-spin stroke-[2]" />
+                    <span>Signing in...</span>
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-4 h-4 fill-white" viewBox="0 0 24 24">
+                      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
+                      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
+                    </svg>
+                    <span>Sign in with Google</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                onClick={enterGuestMode}
+                className="w-full py-3 px-5 bg-zinc-50 hover:bg-zinc-100 text-zinc-600 rounded-xl font-sans text-xs font-semibold tracking-wide transition-all duration-150 flex items-center justify-center space-x-2 border border-zinc-200/80 cursor-pointer shadow-sm"
+              >
+                <span>Try Guest Mode (Local Sandbox)</span>
+              </button>
+            </div>
           </motion.div>
         </main>
 
@@ -640,6 +854,20 @@ export default function Home() {
       {/* --- MAIN CORE STAGE --- */}
       <main className="flex-grow flex flex-col items-center justify-center space-y-12 w-full max-w-lg mx-auto">
         
+        {isGuestMode && (
+          <motion.div
+            initial={{ opacity: 0, y: -5 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="w-full bg-zinc-50 border border-zinc-200/60 rounded-xl p-3.5 text-xs text-zinc-600 font-sans font-medium text-center flex items-center justify-center gap-2 shadow-xs"
+          >
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-zinc-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-zinc-500"></span>
+            </span>
+            <span>Running in <strong className="font-semibold text-zinc-800">Local Guest Mode</strong>. Your data remains secure on your device.</span>
+          </motion.div>
+        )}
+
         {/* SECTION A: THE STRANGER'S MESSAGE CARD */}
         <div className="w-full">
           <div className="flex items-center justify-between mb-3 px-1">
