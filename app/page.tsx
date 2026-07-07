@@ -1,36 +1,16 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, User } from "firebase/auth";
-import {
-  collection,
-  doc,
-  getDocs,
-  getDoc,
-  getDocFromServer,
-  setDoc,
-  updateDoc,
-  query,
-  where,
-  orderBy,
-  limit,
-  serverTimestamp,
-  Timestamp,
-  writeBatch
-} from "firebase/firestore";
-import { auth, db } from "@/lib/firebase";
-import { handleFirestoreError, OperationType } from "@/lib/firebase-errors";
 import { motion, AnimatePresence } from "motion/react";
-import { Send, Eye, ShieldAlert, Heart, Info, Clock, RotateCw, AlertTriangle, ArrowRight, Lock, Sun, Moon, Type } from "lucide-react";
+import { Send, ShieldAlert, Clock, RotateCw, Sun, Moon, Type, Check, Eye, Heart } from "lucide-react";
 
 // Types
 interface Message {
   id: string;
   text: string;
   senderId: string;
-  createdAt: Timestamp | null;
+  createdAt: number | null; // epoch timestamp
   reports: number;
-  randomId: number;
 }
 
 // Starter seed messages
@@ -42,24 +22,56 @@ const STARTER_MESSAGES = [
   "The best way to appreciate a quiet moment is to share it anonymously."
 ];
 
+// Deterministic stats generator for messages
+const getMessageStats = (id: string) => {
+  if (id === "system-empty" || !id) {
+    return { views: 0, likes: 0, formattedViews: "0", formattedLikes: "0" };
+  }
+  
+  // Use a simple hash of the ID to generate a consistent number
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = id.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  hash = Math.abs(hash);
+
+  let views = 0;
+  // Make roughly 1 in 4 starter/system/user messages highly reshared/viral (> 50k views)
+  if (hash % 4 === 0) {
+    views = 51000 + (hash % 44000); // 51K - 95K
+  } else {
+    views = 2100 + (hash % 6800); // 2.1K - 8.9K
+  }
+
+  // Likes are a percentage of views (between 4% and 12%)
+  const likePercentage = 0.04 + ((hash % 8) / 100);
+  const likes = Math.floor(views * likePercentage);
+
+  const formatNumber = (num: number) => {
+    if (num >= 1000) {
+      return (num / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+    }
+    return num.toString();
+  };
+
+  return {
+    views,
+    likes,
+    formattedViews: formatNumber(views),
+    formattedLikes: formatNumber(likes)
+  };
+};
+
 export default function Home() {
-  // --- 1. State & Ref Declarations (Grouped at the top) ---
-  const [user, setUser] = useState<User | null>(null);
-  const [isGuestMode, setIsGuestMode] = useState(false);
+  // --- 1. State Declarations ---
+  const [userId, setUserId] = useState<string>("");
   const [appReady, setAppReady] = useState(false);
-  const [initError, setInitError] = useState<string | null>(null);
-  const [loadingMessage, setLoadingMessage] = useState("Connecting...");
-
-  // Sign In states
-  const [signingIn, setSigningIn] = useState(false);
-  const [signInError, setSignInError] = useState<string | null>(null);
-
-  // App States
   const [currentStrangerMessage, setCurrentStrangerMessage] = useState<Message | null>(null);
   const [lastUserMessage, setLastUserMessage] = useState<Message | null>(null);
   const [hasSentToday, setHasSentToday] = useState(false);
   const [cooldownRemaining, setCooldownRemaining] = useState<number | null>(null); // milliseconds
-  const [totalMessagesCount, setTotalMessagesCount] = useState<number | null>(null);
+  const [totalMessagesCount, setTotalMessagesCount] = useState<number>(STARTER_MESSAGES.length);
+  const [likedMessageIds, setLikedMessageIds] = useState<Record<string, boolean>>({});
 
   // Readability / Accessibility States for the Message Display Card
   const [cardTheme, setCardTheme] = useState<"light" | "dark">("light");
@@ -72,7 +84,7 @@ export default function Home() {
   const [submittingReport, setSubmittingReport] = useState(false);
   const [reportedIds, setReportedIds] = useState<string[]>([]);
 
-  // Local state for statistics (fun little footer features)
+  // Statistics
   const [stats, setStats] = useState({
     sentCount: 0,
     receivedCount: 0
@@ -81,117 +93,43 @@ export default function Home() {
   // Countdown timer reference
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // --- 2. Callback & Event Handlers ---
-  const handleGoogleSignIn = async () => {
-    setSigningIn(true);
-    setSignInError(null);
-    try {
-      const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
-    } catch (error) {
-      console.error("Google sign in failed:", error);
-      setSignInError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setSigningIn(false);
-    }
-  };
-
-  const handleSignOut = async () => {
-    try {
-      if (!isGuestMode) {
-        await signOut(auth);
-      }
-      // Reset all user-specific states
-      setUser(null);
-      setIsGuestMode(false);
-      setHasSentToday(false);
-      setLastUserMessage(null);
-      setCurrentStrangerMessage(null);
-    } catch (error) {
-      console.error("Sign out failed:", error);
-    }
-  };
-
-  const enterGuestMode = useCallback(async () => {
-    setIsGuestMode(true);
-    setInitError(null);
-    setAppReady(false);
-    setLoadingMessage("Entering Guest Mode...");
-    
-    // Simulate slight loading for beautiful polish
-    setTimeout(async () => {
-      const guestUser = {
-        uid: "guest-user-id",
-        email: "guest@pool.local",
-      } as User;
-      
-      setUser(guestUser);
-      
-      // Initialize guest pool if not present
-      if (typeof window !== "undefined") {
-        const localPool = localStorage.getItem("rp2p_guest_pool");
-        if (!localPool) {
-          const initialPool = STARTER_MESSAGES.map((text, idx) => ({
-            id: `g-starter-${idx + 1}`,
-            text,
-            senderId: "system",
-            createdAt: null,
-            reports: 0,
-            randomId: Math.random()
-          }));
-          localStorage.setItem("rp2p_guest_pool", JSON.stringify(initialPool));
-        }
-      }
-      
-      // Load guest states
-      const localPoolStr = localStorage.getItem("rp2p_guest_pool") || "[]";
-      const localPool = JSON.parse(localPoolStr);
-      setTotalMessagesCount(localPool.length);
-      
-      const savedLastSent = localStorage.getItem("rp2p_guest_last_sent");
-      if (savedLastSent) {
-        const lastSentTime = parseInt(savedLastSent, 10);
-        const now = Date.now();
-        const dayInMillis = 24 * 60 * 60 * 1000;
-        const timePassed = now - lastSentTime;
-        if (timePassed < dayInMillis) {
-          setHasSentToday(true);
-          const savedLastMsg = localStorage.getItem("rp2p_guest_last_msg");
-          setLastUserMessage(savedLastMsg ? JSON.parse(savedLastMsg) : { text: "Your message is active." });
-          setCooldownRemaining(dayInMillis - timePassed);
-        } else {
-          setHasSentToday(false);
-          setLastUserMessage(null);
-          setCooldownRemaining(null);
-        }
-      } else {
-        setHasSentToday(false);
-        setLastUserMessage(null);
-        setCooldownRemaining(null);
-      }
-      
-      const eligible = localPool.filter((msg: any) => msg.senderId !== "guest-user-id" && !reportedIds.includes(msg.id) && msg.reports < 3);
-      if (eligible.length > 0) {
-        const randomMsg = eligible[Math.floor(Math.random() * eligible.length)];
-        setCurrentStrangerMessage(randomMsg);
-      } else {
-        setCurrentStrangerMessage({
-          id: "system-empty",
-          text: "The pool is currently quiet. Write a message to share your thoughts.",
-          senderId: "system",
-          createdAt: null,
-          reports: 0,
-          randomId: 0.5
-        });
-      }
-      
-      setAppReady(true);
-    }, 800);
-  }, [reportedIds]);
-
-  // Load preferences on mount
+  // --- 2. Initial Setup & Seeding ---
   useEffect(() => {
     if (typeof window !== "undefined") {
+      // 1. Get or generate User ID
+      let savedUserId = localStorage.getItem("rp2p_user_id");
+      if (!savedUserId) {
+        savedUserId = `peer_${Math.random().toString(36).substring(2, 10)}`;
+        localStorage.setItem("rp2p_user_id", savedUserId);
+      }
+      setUserId(savedUserId);
+
+      // 2. Initialize message pool if empty
+      const localPoolStr = localStorage.getItem("rp2p_pool");
+      let currentPool: Message[] = [];
+      if (!localPoolStr) {
+        currentPool = STARTER_MESSAGES.map((text, idx) => ({
+          id: `starter-${idx + 1}`,
+          text,
+          senderId: "system",
+          createdAt: Date.now() - (5 - idx) * 3600000, // staggered times in past
+          reports: 0
+        }));
+        localStorage.setItem("rp2p_pool", JSON.stringify(currentPool));
+      } else {
+        currentPool = JSON.parse(localPoolStr);
+      }
+      setTotalMessagesCount(currentPool.length);
+
+      // 3. Load stats
+      const savedSent = localStorage.getItem("rp2p_sent_count");
+      const savedRecv = localStorage.getItem("rp2p_received_count");
+      setStats({
+        sentCount: parseInt(savedSent || "0", 10),
+        receivedCount: parseInt(savedRecv || "0", 10)
+      });
+
+      // 4. Load card preferences
       const savedTheme = localStorage.getItem("rp2p_card_theme");
       if (savedTheme === "light" || savedTheme === "dark") {
         setCardTheme(savedTheme);
@@ -200,245 +138,106 @@ export default function Home() {
       if (savedSize === "sm" || savedSize === "md" || savedSize === "lg") {
         setCardFontSize(savedSize);
       }
+
+      // 5. Load reported IDs
+      const savedReports = localStorage.getItem("rp2p_reported_ids");
+      const parsedReports = savedReports ? JSON.parse(savedReports) : [];
+      setReportedIds(parsedReports);
+
+      // 5.5 Load liked message IDs
+      const savedLikes = localStorage.getItem("rp2p_liked_ids");
+      if (savedLikes) {
+        setLikedMessageIds(JSON.parse(savedLikes));
+      }
+
+      // 6. Check cooldown / daily sent status
+      const savedLastSent = localStorage.getItem("rp2p_last_sent");
+      if (savedLastSent) {
+        const lastSentTime = parseInt(savedLastSent, 10);
+        const now = Date.now();
+        const dayInMillis = 24 * 60 * 60 * 1000;
+        const timePassed = now - lastSentTime;
+        if (timePassed < dayInMillis) {
+          setHasSentToday(true);
+          const savedLastMsg = localStorage.getItem("rp2p_last_msg");
+          setLastUserMessage(savedLastMsg ? JSON.parse(savedLastMsg) : { text: "Your message is active." });
+          setCooldownRemaining(dayInMillis - timePassed);
+        }
+      }
+
+      // 7. Get initial random message
+      fetchInitialRandomMessage(savedUserId, parsedReports, currentPool);
+
+      setAppReady(true);
     }
   }, []);
 
-  // Save preferences when they change
+  // --- 3. Retrieve Random Message helper ---
+  const fetchInitialRandomMessage = (uid: string, reports: string[], pool: Message[]) => {
+    const eligible = pool.filter(
+      (msg) => msg.senderId !== uid && !reports.includes(msg.id) && msg.reports < 3
+    );
+
+    if (eligible.length > 0) {
+      const randomMsg = eligible[Math.floor(Math.random() * eligible.length)];
+      setCurrentStrangerMessage(randomMsg);
+    } else {
+      setCurrentStrangerMessage({
+        id: "system-empty",
+        text: "The pool is currently quiet. Write a message to share your thoughts.",
+        senderId: "system",
+        createdAt: null,
+        reports: 0
+      });
+    }
+  };
+
+  const fetchRandomMessage = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const localPoolStr = localStorage.getItem("rp2p_pool") || "[]";
+    const pool: Message[] = JSON.parse(localPoolStr);
+    
+    const eligible = pool.filter(
+      (msg) => msg.senderId !== userId && !reportedIds.includes(msg.id) && msg.reports < 3
+    );
+
+    if (eligible.length > 0) {
+      // Select a message that is different from current display if possible
+      let chosen = eligible[Math.floor(Math.random() * eligible.length)];
+      if (eligible.length > 1 && currentStrangerMessage && chosen.id === currentStrangerMessage.id) {
+        const filtered = eligible.filter(m => m.id !== currentStrangerMessage.id);
+        chosen = filtered[Math.floor(Math.random() * filtered.length)];
+      }
+      
+      setCurrentStrangerMessage(chosen);
+      setStats(prev => {
+        const nextStats = { ...prev, receivedCount: prev.receivedCount + 1 };
+        localStorage.setItem("rp2p_received_count", nextStats.receivedCount.toString());
+        return nextStats;
+      });
+    } else {
+      setCurrentStrangerMessage({
+        id: "system-empty",
+        text: "The pool is currently quiet. Write a message to share your thoughts.",
+        senderId: "system",
+        createdAt: null,
+        reports: 0
+      });
+    }
+  }, [userId, reportedIds, currentStrangerMessage]);
+
+  // --- 4. Preferences Handlers ---
   const toggleCardTheme = () => {
     const nextTheme = cardTheme === "light" ? "dark" : "light";
     setCardTheme(nextTheme);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("rp2p_card_theme", nextTheme);
-    }
+    localStorage.setItem("rp2p_card_theme", nextTheme);
   };
 
   const cycleCardFontSize = () => {
     const nextSize = cardFontSize === "sm" ? "md" : cardFontSize === "md" ? "lg" : "sm";
     setCardFontSize(nextSize);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("rp2p_card_font_size", nextSize);
-    }
+    localStorage.setItem("rp2p_card_font_size", nextSize);
   };
-
-  // --- 3. Connection Validation & Seeding ---
-  const validateAndSeed = useCallback(async () => {
-    setLoadingMessage("Checking connection...");
-    const connPath = "test/connection";
-    try {
-      // Validate connection to Firestore as per instructions
-      await getDocFromServer(doc(db, "test", "connection"));
-    } catch (error) {
-      console.warn("Initial direct server check failed, attempting normal read...", error);
-    }
-
-    setLoadingMessage("Connecting to database...");
-    const messagesPath = "messages";
-    try {
-      // Check message pool size
-      console.log("rp2p: Querying messages to check pool size...");
-      const countQuery = query(collection(db, "messages"), limit(1));
-      let snapshot;
-      try {
-        snapshot = await getDocs(countQuery);
-        console.log("rp2p: Querying messages succeeded, size:", snapshot.size);
-      } catch (readError) {
-        console.error("rp2p: Querying messages failed:", readError);
-        throw readError;
-      }
-      
-      if (snapshot.empty) {
-        setLoadingMessage("Setting up message pool...");
-        console.log("rp2p: Pool is empty, preparing batch seed...");
-        const batch = writeBatch(db);
-        
-        for (const text of STARTER_MESSAGES) {
-          const newDocRef = doc(collection(db, "messages"));
-          batch.set(newDocRef, {
-            text,
-            senderId: "system",
-            createdAt: serverTimestamp(),
-            reports: 0,
-            randomId: Math.random()
-          });
-        }
-        try {
-          await batch.commit();
-          console.log("rp2p: Database seeded successfully with starter messages!");
-        } catch (writeError) {
-          console.error("rp2p: Seeding batch commit failed:", writeError);
-          // Throw a specific error so we know it was a write error
-          throw new Error(`Seeding failed: ${writeError instanceof Error ? writeError.message : String(writeError)}`);
-        }
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, messagesPath);
-    }
-  }, []);
-
-  // --- 2. Query Total Count for Social Proof ---
-  const fetchTotalCount = useCallback(async () => {
-    if (isGuestMode) {
-      if (typeof window !== "undefined") {
-        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
-        setTotalMessagesCount(localPool.length);
-      }
-      return;
-    }
-    const messagesPath = "messages";
-    try {
-      const q = query(collection(db, "messages"));
-      const snapshot = await getDocs(q);
-      setTotalMessagesCount(snapshot.size);
-    } catch (err) {
-      console.error("Error fetching count:", err);
-    }
-  }, [isGuestMode]);
-
-  // --- 3. Retrieve Random Stranger Message ---
-  const fetchRandomMessage = useCallback(async (currentUserUid: string) => {
-    if (isGuestMode) {
-      if (typeof window !== "undefined") {
-        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
-        const eligible = localPool.filter((msg: any) => msg.senderId !== currentUserUid && !reportedIds.includes(msg.id) && msg.reports < 3);
-        if (eligible.length > 0) {
-          const randomMsg = eligible[Math.floor(Math.random() * eligible.length)];
-          setCurrentStrangerMessage(randomMsg);
-          setStats(prev => ({ ...prev, receivedCount: prev.receivedCount + 1 }));
-        } else {
-          setCurrentStrangerMessage({
-            id: "system-empty",
-            text: "The pool is currently quiet. Write a message to share your thoughts.",
-            senderId: "system",
-            createdAt: null,
-            reports: 0,
-            randomId: 0.5
-          });
-        }
-      }
-      return;
-    }
-    const messagesPath = "messages";
-    try {
-      const r = Math.random();
-      // O(1) random message retrieval: search >= randomId
-      const qGreater = query(
-        collection(db, "messages"),
-        where("randomId", ">=", r),
-        where("reports", "<", 3),
-        orderBy("randomId"),
-        limit(5) // Fetch a few to filter out current user's messages easily
-      );
-      
-      let snapshot = await getDocs(qGreater);
-      
-      // Fallback: search < randomId if nothing was greater
-      if (snapshot.empty) {
-        const qLesser = query(
-          collection(db, "messages"),
-          where("randomId", "<", r),
-          where("reports", "<", 3),
-          orderBy("randomId", "desc"),
-          limit(5)
-        );
-        snapshot = await getDocs(qLesser);
-      }
-
-      const docsList = snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as Message);
-      
-      // Filter out user's own messages and already reported ones
-      const eligible = docsList.filter(msg => msg.senderId !== currentUserUid && !reportedIds.includes(msg.id));
-
-      if (eligible.length > 0) {
-        setCurrentStrangerMessage(eligible[0]);
-        setStats(prev => ({ ...prev, receivedCount: prev.receivedCount + 1 }));
-      } else {
-        // Absolute fallback: system messages or first matching message
-        const qFallback = query(collection(db, "messages"), where("reports", "<", 3), limit(5));
-        const fallbackSnapshot = await getDocs(qFallback);
-        const fallbackList = fallbackSnapshot.docs.map(d => ({ id: d.id, ...d.data() }) as Message);
-        const fallbackEligible = fallbackList.filter(msg => msg.senderId !== currentUserUid && !reportedIds.includes(msg.id));
-        
-        if (fallbackEligible.length > 0) {
-          setCurrentStrangerMessage(fallbackEligible[0]);
-        } else {
-          setCurrentStrangerMessage({
-            id: "system-empty",
-            text: "The pool is currently quiet. Write a message to share your thoughts.",
-            senderId: "system",
-            createdAt: null,
-            reports: 0,
-            randomId: 0.5
-          });
-        }
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, messagesPath);
-    }
-  }, [reportedIds, isGuestMode]);
-
-  // --- 4. Check If User Has Sent Message Today ---
-  const checkSendingStatus = useCallback(async (currentUserUid: string) => {
-    if (isGuestMode) {
-      if (typeof window !== "undefined") {
-        const savedLastSent = localStorage.getItem("rp2p_guest_last_sent");
-        if (savedLastSent) {
-          const lastSentTime = parseInt(savedLastSent, 10);
-          const now = Date.now();
-          const dayInMillis = 24 * 60 * 60 * 1000;
-          const timePassed = now - lastSentTime;
-          if (timePassed < dayInMillis) {
-            setHasSentToday(true);
-            const savedLastMsg = localStorage.getItem("rp2p_guest_last_msg");
-            setLastUserMessage(savedLastMsg ? JSON.parse(savedLastMsg) : { text: "Your message is active." });
-            setCooldownRemaining(dayInMillis - timePassed);
-            return;
-          }
-        }
-      }
-      setHasSentToday(false);
-      setLastUserMessage(null);
-      setCooldownRemaining(null);
-      return;
-    }
-    const messagesPath = "messages";
-    try {
-      const q = query(
-        collection(db, "messages"),
-        where("senderId", "==", currentUserUid),
-        orderBy("createdAt", "desc"),
-        limit(1)
-      );
-      
-      const snapshot = await getDocs(q);
-      
-      if (!snapshot.empty) {
-        const lastMsgDoc = snapshot.docs[0];
-        const lastMsg = { id: lastMsgDoc.id, ...lastMsgDoc.data() } as Message;
-        
-        if (lastMsg.createdAt) {
-          const sentTime = lastMsg.createdAt.toDate().getTime();
-          const now = Date.now();
-          const dayInMillis = 24 * 60 * 60 * 1000;
-          const timePassed = now - sentTime;
-
-          if (timePassed < dayInMillis) {
-            setHasSentToday(true);
-            setLastUserMessage(lastMsg);
-            setCooldownRemaining(dayInMillis - timePassed);
-            return;
-          }
-        }
-      }
-      
-      setHasSentToday(false);
-      setLastUserMessage(null);
-      setCooldownRemaining(null);
-    } catch (error) {
-      console.warn("Could not retrieve daily status (likely missing index or fresh database), resetting to default...", error);
-      setHasSentToday(false);
-      setLastUserMessage(null);
-    }
-  }, [isGuestMode]);
 
   // --- 5. Countdown Handler ---
   useEffect(() => {
@@ -449,6 +248,8 @@ export default function Home() {
             clearInterval(countdownIntervalRef.current!);
             setHasSentToday(false);
             setLastUserMessage(null);
+            localStorage.removeItem("rp2p_last_sent");
+            localStorage.removeItem("rp2p_last_msg");
             return null;
           }
           return prev - 1000;
@@ -463,7 +264,6 @@ export default function Home() {
     };
   }, [cooldownRemaining]);
 
-  // Format Countdown
   const formatCountdown = (millis: number) => {
     const totalSecs = Math.floor(millis / 1000);
     const hours = Math.floor(totalSecs / 3600);
@@ -475,229 +275,115 @@ export default function Home() {
   };
 
   // --- 6. Send Message ---
-  const handleSendMessage = async (e: React.FormEvent) => {
+  const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || sending || newMessage.trim().length === 0 || newMessage.length > 250) return;
+    if (sending || newMessage.trim().length === 0 || newMessage.length > 250) return;
 
     setSending(true);
-    
-    if (isGuestMode) {
-      // Simulate network wait
-      setTimeout(async () => {
-        try {
-          const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
-          const newMsg = {
-            id: `g-user-${Date.now()}`,
-            text: newMessage.trim(),
-            senderId: user.uid,
-            createdAt: null,
-            reports: 0,
-            randomId: Math.random()
-          };
-          
-          localPool.push(newMsg);
-          localStorage.setItem("rp2p_guest_pool", JSON.stringify(localPool));
-          localStorage.setItem("rp2p_guest_last_sent", Date.now().toString());
-          localStorage.setItem("rp2p_guest_last_msg", JSON.stringify(newMsg));
-          
-          setStats(prev => ({ ...prev, sentCount: prev.sentCount + 1 }));
-          setNewMessage("");
-          setSuccess(true);
-          
-          await checkSendingStatus(user.uid);
-          await fetchTotalCount();
-          
-          setTimeout(() => {
-            setSuccess(false);
-          }, 4000);
-        } catch (err) {
-          console.error("Local save failed:", err);
-        } finally {
-          setSending(false);
-        }
-      }, 600);
-      return;
-    }
-    
-    const messagesPath = "messages";
-    
-    try {
-      const newMsgId = doc(collection(db, "messages")).id;
-      const messagePayload = {
+
+    // Simulate network latency for beautiful aesthetic feel
+    setTimeout(() => {
+      const localPoolStr = localStorage.getItem("rp2p_pool") || "[]";
+      const pool: Message[] = JSON.parse(localPoolStr);
+      
+      const newMsg: Message = {
+        id: `user-${Date.now()}`,
         text: newMessage.trim(),
-        senderId: user.uid,
-        createdAt: serverTimestamp(),
-        reports: 0,
-        randomId: Math.random()
+        senderId: userId,
+        createdAt: Date.now(),
+        reports: 0
       };
 
-      await setDoc(doc(db, "messages", newMsgId), messagePayload);
+      pool.push(newMsg);
+      localStorage.setItem("rp2p_pool", JSON.stringify(pool));
+      localStorage.setItem("rp2p_last_sent", Date.now().toString());
+      localStorage.setItem("rp2p_last_msg", JSON.stringify(newMsg));
 
-      // Instantly track user stats
-      setStats(prev => ({ ...prev, sentCount: prev.sentCount + 1 }));
+      const updatedSentCount = stats.sentCount + 1;
+      setStats(prev => ({ ...prev, sentCount: updatedSentCount }));
+      localStorage.setItem("rp2p_sent_count", updatedSentCount.toString());
+
       setNewMessage("");
+      setLastUserMessage(newMsg);
+      setHasSentToday(true);
+      setCooldownRemaining(24 * 60 * 60 * 1000); // 24 hour cooldown
+      setTotalMessagesCount(pool.length);
       setSuccess(true);
-      
-      // Refresh state to trigger countdown
-      await checkSendingStatus(user.uid);
-      await fetchTotalCount();
 
-      // Show success animation then reset success flag (form hides since hasSentToday is now true)
       setTimeout(() => {
         setSuccess(false);
       }, 4000);
 
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, messagesPath);
-    } finally {
       setSending(false);
-    }
+    }, 600);
   };
 
-  // --- 7. Report / Flag Message ---
-  const handleReportMessage = async () => {
-    if (!user || !currentStrangerMessage || submittingReport) return;
+  // --- 7. Report Message ---
+  const handleReportMessage = () => {
+    if (!currentStrangerMessage || submittingReport) return;
 
     setSubmittingReport(true);
     
-    if (isGuestMode) {
-      try {
-        const localPool = JSON.parse(localStorage.getItem("rp2p_guest_pool") || "[]");
-        const updatedPool = localPool.map((msg: any) => {
-          if (msg.id === currentStrangerMessage.id) {
-            return { ...msg, reports: msg.reports + 1 };
-          }
-          return msg;
-        });
-        localStorage.setItem("rp2p_guest_pool", JSON.stringify(updatedPool));
-        
-        setReportedIds(prev => [...prev, currentStrangerMessage.id]);
-        await fetchRandomMessage(user.uid);
-      } catch (err) {
-        console.error("Local report failed:", err);
-      } finally {
-        setSubmittingReport(false);
-      }
-      return;
-    }
-    
-    const messagesPath = `messages/${currentStrangerMessage.id}`;
-    
-    try {
-      const docRef = doc(db, "messages", currentStrangerMessage.id);
-      await updateDoc(docRef, {
-        reports: currentStrangerMessage.reports + 1
-      });
+    setTimeout(() => {
+      const localPoolStr = localStorage.getItem("rp2p_pool") || "[]";
+      const pool: Message[] = JSON.parse(localPoolStr);
 
-      // Mark as reported in client local state
-      setReportedIds(prev => [...prev, currentStrangerMessage.id]);
-      
-      // Load next random message
-      await fetchRandomMessage(user.uid);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, messagesPath);
-    } finally {
+      const updatedPool = pool.map((msg) => {
+        if (msg.id === currentStrangerMessage.id) {
+          return { ...msg, reports: msg.reports + 1 };
+        }
+        return msg;
+      });
+      localStorage.setItem("rp2p_pool", JSON.stringify(updatedPool));
+
+      const nextReports = [...reportedIds, currentStrangerMessage.id];
+      setReportedIds(nextReports);
+      localStorage.setItem("rp2p_reported_ids", JSON.stringify(nextReports));
+
+      // Load next random message immediately
+      const eligible = updatedPool.filter(
+        (msg) => msg.senderId !== userId && !nextReports.includes(msg.id) && msg.reports < 3
+      );
+
+      if (eligible.length > 0) {
+        setCurrentStrangerMessage(eligible[Math.floor(Math.random() * eligible.length)]);
+      } else {
+        setCurrentStrangerMessage({
+          id: "system-empty",
+          text: "The pool is currently quiet. Write a message to share your thoughts.",
+          senderId: "system",
+          createdAt: null,
+          reports: 0
+        });
+      }
+
       setSubmittingReport(false);
+    }, 400);
+  };
+
+  // --- 8. Reset Local Session (Sign out map) ---
+  const handleResetSession = () => {
+    if (confirm("Would you like to reset your local message history, statistics, and session?")) {
+      localStorage.clear();
+      window.location.reload();
     }
   };
 
-  // --- 8. Core Initialization Life Cycle ---
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      try {
-        if (currentUser) {
-          setIsGuestMode(false);
-          setUser(currentUser);
-          
-          // Seed starter messages, validate connection, fetch states
-          await validateAndSeed();
-          await checkSendingStatus(currentUser.uid);
-          await fetchRandomMessage(currentUser.uid);
-          await fetchTotalCount();
-        } else {
-          setUser(prev => {
-            if (prev && prev.uid === "guest-user-id") return prev;
-            return null;
-          });
-        }
-        setAppReady(true);
-      } catch (err) {
-        console.error("Initialization failed:", err);
-        setInitError(err instanceof Error ? err.message : String(err));
-      }
-    });
-
-    return () => unsubscribe();
-  }, [validateAndSeed, checkSendingStatus, fetchRandomMessage, fetchTotalCount, isGuestMode]);
-
-  // Load custom stats from LocalStorage on mount
-  useEffect(() => {
-    const savedSent = localStorage.getItem("rp2p_sent_count");
-    const savedRecv = localStorage.getItem("rp2p_received_count");
-    if (savedSent || savedRecv) {
-      setStats({
-        sentCount: parseInt(savedSent || "0", 10),
-        receivedCount: parseInt(savedRecv || "0", 10)
-      });
-    }
-  }, []);
-
-  // Sync custom stats to LocalStorage
-  useEffect(() => {
-    localStorage.setItem("rp2p_sent_count", stats.sentCount.toString());
-    localStorage.setItem("rp2p_received_count", stats.receivedCount.toString());
-  }, [stats]);
-
-
-  // Error State Display
-  if (initError) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen px-6 text-center bg-[#fafafa] text-zinc-900 selection:bg-zinc-100 selection:text-zinc-900">
-        <div className="p-8 bg-white border border-zinc-200 rounded-2xl max-w-md shadow-sm">
-          <AlertTriangle className="w-10 h-10 text-zinc-500 mx-auto mb-4 stroke-[1.5]" />
-          <h2 className="text-lg font-semibold text-zinc-800 mb-2 font-sans">Connection Disrupted</h2>
-          <p className="text-xs text-zinc-500 mb-4 font-sans leading-relaxed">
-            We couldn&apos;t connect to the secure message pool. This can happen during initial database synchronization or under high network latency.
-          </p>
-          <div className="p-3 bg-zinc-50 text-zinc-600 border border-zinc-100 rounded-lg text-left text-xs font-mono overflow-auto max-h-32 mb-4">
-            {initError}
-          </div>
-          <div className="flex flex-col gap-2 w-full">
-            <button 
-              onClick={() => window.location.reload()} 
-              className="w-full px-4 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-white rounded-xl text-xs font-medium tracking-wide transition-all duration-150 cursor-pointer"
-            >
-              Reconnect to Pool
-            </button>
-            <button 
-              onClick={enterGuestMode} 
-              className="w-full px-4 py-2.5 bg-zinc-100 hover:bg-zinc-200 text-zinc-600 rounded-xl text-xs font-medium tracking-wide transition-all duration-150 cursor-pointer border border-zinc-200/50"
-            >
-              Enter Offline Guest Mode
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // Loading State Display
   if (!appReady) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-[#fafafa] text-zinc-900 p-6 selection:bg-zinc-100 selection:text-zinc-900">
+      <div className="flex flex-col items-center justify-center min-h-screen bg-[#fafafa] text-zinc-900 p-6">
         <div className="flex flex-col items-center space-y-4 max-w-md w-full text-center">
           <div className="text-3xl font-extrabold tracking-tight font-sans text-zinc-900 select-none">
             RP2P
           </div>
-          
           <div className="flex flex-col items-center space-y-2">
             <div className="flex space-x-1 items-center justify-center py-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-zinc-300 animate-pulse" style={{ animationDelay: '0ms' }} />
-              <div className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" style={{ animationDelay: '150ms' }} />
-              <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-pulse" style={{ animationDelay: '300ms' }} />
+              <div className="w-1.5 h-1.5 rounded-full bg-zinc-300 animate-pulse" />
+              <div className="w-1.5 h-1.5 rounded-full bg-zinc-400 animate-pulse" />
+              <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-pulse" />
             </div>
             <p className="text-[11px] font-sans font-semibold text-zinc-400 tracking-wider uppercase">
-              {loadingMessage.toUpperCase()}
+              CONNECTING TO SECURE POOL...
             </p>
           </div>
         </div>
@@ -705,108 +391,7 @@ export default function Home() {
     );
   }
 
-  // If not logged in, show a gorgeous minimalist login screen
-  if (!user) {
-    return (
-      <div className="min-h-screen flex flex-col justify-between py-12 px-6 sm:px-12 max-w-4xl mx-auto selection:bg-zinc-100 selection:text-zinc-900 bg-[#fafafa]">
-        <header className="flex flex-col items-center text-center space-y-2 mb-8">
-          <div className="text-3xl font-extrabold tracking-tight font-sans text-zinc-900 select-none">
-            RP2P
-          </div>
-          <p className="text-sm font-medium text-zinc-500 font-sans">
-            An anonymous peer-to-peer message exchange.
-          </p>
-        </header>
-
-        <main className="flex-grow flex flex-col items-center justify-center space-y-8 w-full max-w-md mx-auto">
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.5 }}
-            className="w-full bg-white border border-zinc-200/80 p-8 sm:p-10 rounded-2xl flex flex-col items-center text-center space-y-6 shadow-sm"
-          >
-            <div className="space-y-3">
-              <h2 className="text-base font-semibold tracking-tight text-zinc-800 font-sans">
-                Sign In
-              </h2>
-              <p className="text-xs text-zinc-500 leading-relaxed font-sans">
-                RP2P lets you share a single message and read one from a random peer each day. To keep the network clean and prevent spam, please sign in with Google.
-              </p>
-              <p className="text-xs text-zinc-400 font-medium leading-relaxed font-sans">
-                Your messages are completely anonymous and never linked to your account.
-              </p>
-            </div>
-
-            {signInError && (
-              <div className="w-full p-3 bg-red-50 border border-red-100 text-left text-xs font-semibold text-red-600 font-sans rounded-lg">
-                Authentication failed: {signInError}
-              </div>
-            )}
-
-            <div className="flex flex-col gap-2.5 w-full">
-              <button
-                onClick={handleGoogleSignIn}
-                disabled={signingIn}
-                className="w-full py-3 px-5 bg-zinc-900 hover:bg-zinc-800 disabled:bg-zinc-50 disabled:text-zinc-400 disabled:border-zinc-200 text-white rounded-xl font-sans text-xs uppercase tracking-wider font-semibold transition-all duration-150 flex items-center justify-center space-x-2.5 cursor-pointer disabled:cursor-not-allowed border border-zinc-900"
-              >
-                {signingIn ? (
-                  <>
-                    <RotateCw className="w-4 h-4 animate-spin stroke-[2]" />
-                    <span>Signing in...</span>
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4 fill-white" viewBox="0 0 24 24">
-                      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/>
-                      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/>
-                    </svg>
-                    <span>Sign in with Google</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                onClick={enterGuestMode}
-                className="w-full py-3 px-5 bg-zinc-50 hover:bg-zinc-100 text-zinc-600 rounded-xl font-sans text-xs font-semibold tracking-wide transition-all duration-150 flex items-center justify-center space-x-2 border border-zinc-200/80 cursor-pointer shadow-sm"
-              >
-                <span>Try Guest Mode (Local Sandbox)</span>
-              </button>
-            </div>
-          </motion.div>
-        </main>
-
-        <footer className="mt-16 flex flex-col items-center justify-center space-y-4 text-center text-xs font-sans text-zinc-500">
-          <div className="max-w-xs text-xs text-zinc-400 leading-relaxed font-normal">
-            A minimal, zero-profile peer message board.
-          </div>
-          
-          <div className="flex items-center justify-center gap-6 text-[11px] text-zinc-400 font-sans font-medium">
-            <a 
-              href="https://evu.com" 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="hover:text-zinc-600 transition-colors"
-            >
-              An EVU Venture
-            </a>
-            <span className="text-zinc-200">•</span>
-            <a 
-              href="https://feelize.com/go" 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="hover:text-zinc-600 transition-colors"
-            >
-              Website by Feelize
-            </a>
-          </div>
-        </footer>
-      </div>
-    );
-  }
-
-  // Styling helper variables for the customizable message display card
+  // Card themes helper variables
   const fontSizeClass = 
     cardFontSize === "sm" ? "text-sm sm:text-base font-normal leading-relaxed" :
     cardFontSize === "lg" ? "text-lg sm:text-xl font-normal leading-relaxed" :
@@ -836,46 +421,35 @@ export default function Home() {
     <div className="min-h-screen flex flex-col justify-between py-12 px-6 sm:px-12 max-w-4xl mx-auto selection:bg-zinc-100 selection:text-zinc-900 bg-[#fafafa]">
       {/* --- HEADER --- */}
       <header className="flex flex-col items-center text-center space-y-3 mb-8">
-        <motion.div 
-          initial={{ opacity: 0, y: -10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-          className="flex items-center space-y-1 flex-col"
-        >
+        <div className="flex items-center space-y-1 flex-col">
           <div className="text-3xl font-extrabold tracking-tight font-sans text-zinc-900 select-none">
             RP2P
           </div>
           <p className="text-sm font-medium text-zinc-500 font-sans">
             An anonymous peer-to-peer message exchange.
           </p>
-        </motion.div>
+        </div>
       </header>
 
-      {/* --- MAIN CORE STAGE --- */}
+      {/* --- MAIN STAGE --- */}
       <main className="flex-grow flex flex-col items-center justify-center space-y-12 w-full max-w-lg mx-auto">
-        
-        {isGuestMode && (
-          <motion.div
-            initial={{ opacity: 0, y: -5 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="w-full bg-zinc-50 border border-zinc-200/60 rounded-xl p-3.5 text-xs text-zinc-600 font-sans font-medium text-center flex items-center justify-center gap-2 shadow-xs"
-          >
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-zinc-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-zinc-500"></span>
-            </span>
-            <span>Running in <strong className="font-semibold text-zinc-800">Local Guest Mode</strong>. Your data remains secure on your device.</span>
-          </motion.div>
-        )}
+        {/* Status bar */}
+        <div className="w-full bg-zinc-50 border border-zinc-200/60 rounded-xl p-3.5 text-xs text-zinc-600 font-sans font-medium text-center flex items-center justify-center gap-2 shadow-xs">
+          <span className="relative flex h-2 w-2">
+            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-zinc-400 opacity-75"></span>
+            <span className="relative inline-flex rounded-full h-2 w-2 bg-zinc-500"></span>
+          </span>
+          <span>Running in <strong className="font-semibold text-zinc-800">Local Sandbox Mode</strong>. Your messages are private and stored locally.</span>
+        </div>
 
-        {/* SECTION A: THE STRANGER'S MESSAGE CARD */}
+        {/* SECTION A: STRANGER CARD */}
         <div className="w-full">
           <div className="flex items-center justify-between mb-3 px-1">
             <p className="text-xs text-zinc-500 font-sans font-medium flex items-center gap-1.5 select-none">
               Random Message
             </p>
             
-            {/* Readability & Theme Controls */}
+            {/* Display Settings */}
             <div className="flex items-center gap-2">
               <button
                 onClick={cycleCardFontSize}
@@ -910,8 +484,90 @@ export default function Home() {
                   boxShadow: cardShadow
                 }}
               >
-                {/* Visual block detail */}
                 <div className={`absolute top-0 left-0 w-full h-1 transition-colors duration-150 ${cardLineClass}`}></div>
+ 
+                {/* Visual view counter, progress bar and interactive fake heart button */}
+                {(() => {
+                  const msgStats = getMessageStats(currentStrangerMessage.id);
+                  const isLiked = !!likedMessageIds[currentStrangerMessage.id];
+                  const displayLikesCount = msgStats.likes + (isLiked ? 1 : 0);
+                  const formattedDisplayLikes = displayLikesCount >= 1000 
+                    ? (displayLikesCount / 1000).toFixed(1).replace(/\.0$/, "") + "K" 
+                    : displayLikesCount.toString();
+                  // Scale view progress relative to 100k views max
+                  const progressPercent = Math.min(100, Math.max(10, Math.round((msgStats.views / 100000) * 100)));
+                  
+                  return (
+                    <div className="flex flex-col gap-2 border-b border-zinc-100 dark:border-zinc-800/40 pb-4 mb-4 select-none">
+                      <div className="flex items-center justify-between">
+                        <div className="flex flex-col gap-0.5">
+                          <span className="flex items-center gap-1.5 text-[11px] font-sans font-bold tracking-wider text-zinc-400 dark:text-zinc-500 uppercase">
+                            <Eye className="w-3.5 h-3.5 text-zinc-400 dark:text-zinc-500" />
+                            <span>{msgStats.formattedViews} Views</span>
+                          </span>
+                        </div>
+                        
+                        {currentStrangerMessage.id !== "system-empty" && (
+                          <motion.button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              const nextLikes = {
+                                ...likedMessageIds,
+                                [currentStrangerMessage.id]: !isLiked
+                              };
+                              setLikedMessageIds(nextLikes);
+                              localStorage.setItem("rp2p_liked_ids", JSON.stringify(nextLikes));
+                            }}
+                            whileTap={{ scale: 0.85 }}
+                            className={`px-3 py-1.5 rounded-full transition-all duration-150 flex items-center gap-1.5 cursor-pointer border ${
+                              isLiked 
+                                ? "bg-rose-50 text-rose-500 border-rose-100 dark:bg-rose-950/20 dark:text-rose-400 dark:border-rose-900/30" 
+                                : "bg-zinc-50/50 text-zinc-400 hover:text-rose-500 hover:bg-rose-50/30 border-zinc-100 hover:border-rose-100/40 dark:bg-zinc-800/30 dark:text-zinc-500 dark:hover:text-rose-400 dark:hover:bg-rose-950/10 dark:border-zinc-800/50"
+                            }`}
+                            title={isLiked ? "Unlike message" : "Heart message"}
+                          >
+                            <motion.div
+                              animate={{ 
+                                scale: isLiked ? [1, 1.4, 1] : 1,
+                                rotate: isLiked ? [0, 15, -15, 0] : 0
+                              }}
+                              transition={{ duration: 0.35 }}
+                            >
+                              <Heart 
+                                className={`w-3.5 h-3.5 ${isLiked ? "fill-rose-500 dark:fill-rose-400 stroke-rose-500 dark:stroke-rose-400" : "stroke-current"}`} 
+                              />
+                            </motion.div>
+                            <span className="text-xs font-semibold font-mono tracking-tight leading-none">
+                              {formattedDisplayLikes}
+                            </span>
+                          </motion.button>
+                        )}
+                      </div>
+                      
+                      {/* Reach Velocity Progress Bar */}
+                      <div className="space-y-1">
+                        <div className="h-1 w-full bg-zinc-100 dark:bg-zinc-800 rounded-full overflow-hidden">
+                          <motion.div 
+                            className={`h-full rounded-full ${
+                              msgStats.views > 50000 
+                                ? "bg-gradient-to-r from-amber-400 to-rose-400" 
+                                : "bg-gradient-to-r from-zinc-300 to-zinc-400 dark:from-zinc-700 dark:to-zinc-600"
+                            }`}
+                            initial={{ width: 0 }}
+                            animate={{ width: `${progressPercent}%` }}
+                            transition={{ duration: 0.6, ease: "easeOut" }}
+                          />
+                        </div>
+                        <div className="flex justify-between items-center text-[9px] font-sans font-bold tracking-wider uppercase">
+                          <span className="text-zinc-400/80 dark:text-zinc-500">Peer Propagation</span>
+                          <span className={msgStats.views > 50000 ? "text-amber-500 dark:text-amber-400 animate-pulse" : "text-zinc-400/80 dark:text-zinc-500"}>
+                            {msgStats.views > 50000 ? "🔥 Reshared / Viral Reach" : "Standard Reach"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
  
                 {/* Message Text */}
                 <div className="my-auto py-4">
@@ -920,7 +576,7 @@ export default function Home() {
                   </p>
                 </div>
  
-                {/* Footer of the card */}
+                {/* Message Footer */}
                 <div className={`transition-colors duration-150 ${cardDividerClass}`}>
                   <span className="flex items-center gap-1.5 select-none text-xs text-zinc-400 font-medium">
                     {currentStrangerMessage.createdAt 
@@ -930,7 +586,7 @@ export default function Home() {
                   
                   <div className="flex flex-wrap items-center gap-2">
                     <button
-                      onClick={() => fetchRandomMessage(user?.uid || "")}
+                      onClick={fetchRandomMessage}
                       title="Show another message"
                       className="px-3 py-1.5 bg-zinc-50 hover:bg-zinc-100 text-zinc-600 hover:text-zinc-800 border border-zinc-100 text-xs font-medium tracking-wide transition-all duration-150 flex items-center justify-center gap-1.5 cursor-pointer rounded-full"
                     >
@@ -960,11 +616,9 @@ export default function Home() {
           </AnimatePresence>
         </div>
 
-        {/* SECTION B: ACTIONS / FORM COMPOSER */}
+        {/* SECTION B: COMPOSER OR COOLDOWN */}
         <div className="w-full">
           <AnimatePresence mode="wait">
-            
-            {/* SUCCESS VIEW ANIMATION */}
             {success ? (
               <motion.div
                 key="success"
@@ -974,7 +628,7 @@ export default function Home() {
                 className="bg-white border border-zinc-200 p-8 rounded-2xl text-center space-y-4 shadow-sm"
               >
                 <div className="w-10 h-10 bg-zinc-50 border border-zinc-100 rounded-full flex items-center justify-center mx-auto text-zinc-600">
-                  <Send className="w-4 h-4 stroke-[1.5]" />
+                  <Check className="w-4 h-4 stroke-[1.5]" />
                 </div>
                 <h3 className="text-base font-semibold text-zinc-800 tracking-tight font-sans">Message Sent</h3>
                 <p className="text-xs text-zinc-500 font-medium leading-relaxed font-sans">
@@ -982,8 +636,6 @@ export default function Home() {
                 </p>
               </motion.div>
             ) : hasSentToday ? (
-              
-              /* DAILY COOLDOWN STATE */
               <motion.div
                 key="cooldown"
                 initial={{ opacity: 0, y: 10 }}
@@ -1013,7 +665,6 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* Show the user's own sent message */}
                 {lastUserMessage && (
                   <div className="w-full border-t border-zinc-100 pt-5 text-left mt-2">
                     <p className="text-xs text-zinc-400 font-sans font-medium mb-2">
@@ -1026,8 +677,6 @@ export default function Home() {
                 )}
               </motion.div>
             ) : (
-              
-              /* WRITE MESSAGE COMPOSER */
               <motion.form
                 key="composer"
                 onSubmit={handleSendMessage}
@@ -1051,7 +700,6 @@ export default function Home() {
                       className="w-full bg-white border border-zinc-200 rounded-2xl p-5 text-sm font-medium leading-relaxed text-zinc-700 placeholder-zinc-400 focus:outline-none focus:border-zinc-400 focus:ring-1 focus:ring-zinc-400/10 transition-all resize-none font-sans shadow-sm"
                     />
                     
-                    {/* Character count ring/text */}
                     <div className="absolute bottom-4 right-4 text-xs font-sans font-medium text-zinc-400 bg-zinc-50 border border-zinc-100 px-2 py-0.5 rounded-full select-none">
                       <span className={newMessage.length >= 240 ? "text-red-500 font-semibold" : "text-zinc-500"}>
                         {newMessage.length}
@@ -1086,33 +734,29 @@ export default function Home() {
 
       {/* --- FOOTER & METRICS --- */}
       <footer className="mt-16 flex flex-col items-center justify-center space-y-6 text-center text-xs font-sans text-zinc-500">
-        
-        {/* Simple, clean inline metadata */}
         <div className="flex flex-wrap items-center justify-center gap-4 text-xs text-zinc-400 select-none">
-          <span>Active minds: <strong className="font-semibold text-zinc-600">{totalMessagesCount !== null ? totalMessagesCount : '—'}</strong></span>
+          <span>Active minds: <strong className="font-semibold text-zinc-600">{totalMessagesCount}</strong></span>
           <span className="text-zinc-200">•</span>
           <span>Messages sent: <strong className="font-semibold text-zinc-600">{stats.sentCount}</strong></span>
           <span className="text-zinc-200">•</span>
           <span>Messages read: <strong className="font-semibold text-zinc-600">{stats.receivedCount}</strong></span>
         </div>
 
-        {/* Minimal concept notes */}
         <div className="max-w-xs text-xs text-zinc-400 leading-relaxed font-normal">
           A minimal text space. No profiles, no trackers, no social features. Just one anonymous message shared per day.
         </div>
 
         <div className="flex items-center gap-2 text-xs text-zinc-400 font-sans font-medium">
-          <span>Signed in as <strong className="font-medium text-zinc-600">{user.email?.split('@')[0]}</strong></span>
+          <span>Logged in as <strong className="font-medium text-zinc-600">{userId ? userId : "guest"}</strong></span>
           <span className="text-zinc-200">•</span>
           <button 
-            onClick={handleSignOut}
+            onClick={handleResetSession}
             className="hover:text-red-500 hover:underline transition-colors cursor-pointer"
           >
-            Sign out
+            Reset Session
           </button>
         </div>
 
-        {/* Footer linkages */}
         <div className="flex items-center justify-center gap-6 text-[11px] text-zinc-400 font-sans font-medium border-t border-zinc-200/40 w-full max-w-md pt-6">
           <a 
             href="https://evu.com" 
